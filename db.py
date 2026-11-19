@@ -1,13 +1,17 @@
 """
 Base de datos de Gastito (SQLite).
 
-Tiene dos tablas:
-- mensajes: el historial de conversación (v3), que le da memoria al bot.
-- gastos: el registro permanente de gastos de cada usuario (v4).
+Tablas:
+- mensajes:     historial de conversación (v3), que le da memoria al bot.
+- gastos:       registro permanente de gastos de cada usuario (v4).
+- analisis:     análisis mensuales con salida estructurada (v5).
+- presupuestos: presupuesto mensual armado con el flujo guiado /presupuesto (v6).
 
 Se utiliza aiosqlite, la versión asíncrona de sqlite3, para que las
 operaciones sobre la base no bloqueen al bot mientras atiende a otros usuarios.
 """
+
+import json                             # convierte listas a texto para guardarlas en SQLite
 
 import aiosqlite                        # SQLite con soporte para async/await
 
@@ -17,7 +21,8 @@ RUTA_DB = "gastito.db"
 
 # Sentencias SQL que definen la estructura de la base.
 # IF NOT EXISTS hace que puedan ejecutarse en cada arranque sin error: si la
-# base ya existe desde la v3, solo se crea la tabla nueva y el historial queda intacto.
+# base ya existe de una versión anterior, solo se crean las tablas nuevas y
+# los datos existentes quedan intactos.
 ESQUEMA = """
 CREATE TABLE IF NOT EXISTS mensajes (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,                -- orden de llegada
@@ -41,6 +46,33 @@ CREATE TABLE IF NOT EXISTS gastos (
 );
 -- Índice que acelera la búsqueda de los gastos de un usuario por fecha.
 CREATE INDEX IF NOT EXISTS idx_gastos_usuario_fecha ON gastos (user_id, fecha);
+
+-- Análisis mensuales (v5). Cada columna corresponde a un campo del análisis estructurado.
+CREATE TABLE IF NOT EXISTS analisis (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id             INTEGER NOT NULL,
+    mes                 TEXT    NOT NULL,                     -- AAAA-MM
+    total_gastado       REAL    NOT NULL,
+    estado              TEXT    NOT NULL,                     -- dentro del presupuesto, en riesgo, excedido o sin presupuesto
+    categoria_principal TEXT    NOT NULL,
+    porcentaje_principal INTEGER NOT NULL,                    -- de 0 a 100
+    gastos_hormiga      TEXT    NOT NULL,                     -- lista guardada como texto JSON
+    recomendaciones     TEXT    NOT NULL,                     -- lista guardada como texto JSON
+    resumen             TEXT    NOT NULL,
+    creado              TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Presupuestos mensuales (v6). Un presupuesto por usuario y por mes:
+-- UNIQUE hace que uno nuevo del mismo mes reemplace al anterior.
+CREATE TABLE IF NOT EXISTS presupuestos (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    mes     TEXT    NOT NULL,                                 -- AAAA-MM
+    ingreso REAL    NOT NULL CHECK (ingreso > 0),             -- plata disponible en el mes
+    ahorro  REAL    NOT NULL CHECK (ahorro >= 0),              -- meta de ahorro del mes
+    creado  TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (user_id, mes)
+);
 """
 
 
@@ -91,7 +123,7 @@ async def obtener_historial(user_id: int, limite: int) -> list[tuple[str, str]]:
 
 async def borrar_historial(user_id: int) -> int:
     """Borra la conversación de un usuario y devuelve cuántos mensajes eliminó.
-    Los gastos registrados NO se borran: son un registro aparte."""
+    Los gastos, análisis y presupuestos NO se borran: son registros aparte."""
     async with aiosqlite.connect(RUTA_DB) as db:
         cursor = await db.execute("DELETE FROM mensajes WHERE user_id = ?", (user_id,))
         await db.commit()
@@ -150,6 +182,20 @@ async def resumen_gastos(user_id: int, mes: str) -> dict:
             "por_categoria_ars": por_categoria, "ultimos": ultimos}
 
 
+async def gastos_del_mes(user_id: int, mes: str) -> list[dict]:
+    """Devuelve todos los gastos de un mes, del más antiguo al más reciente (para /analizar)."""
+    async with aiosqlite.connect(RUTA_DB) as db:
+        cursor = await db.execute(
+            "SELECT fecha, categoria, descripcion, monto FROM gastos "
+            "WHERE user_id = ? AND fecha LIKE ? ORDER BY fecha, id",
+            (user_id, f"{mes}%"),
+        )
+        return [
+            {"fecha": f, "categoria": c, "descripcion": d, "monto_ars": m}
+            for f, c, d, m in await cursor.fetchall()
+        ]
+
+
 async def borrar_ultimo_gasto(user_id: int) -> dict | None:
     """Borra el último gasto registrado del usuario y lo devuelve (None si no había)."""
     async with aiosqlite.connect(RUTA_DB) as db:
@@ -171,3 +217,63 @@ async def borrar_gastos(user_id: int) -> int:
         cursor = await db.execute("DELETE FROM gastos WHERE user_id = ?", (user_id,))
         await db.commit()
         return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
+# Análisis mensual (v5)
+# ---------------------------------------------------------------------------
+
+async def guardar_analisis(user_id: int, mes: str, total: float, analisis) -> int:
+    """Guarda un análisis mensual (un objeto AnalisisMes) y devuelve su id."""
+    async with aiosqlite.connect(RUTA_DB) as db:
+        cursor = await db.execute(
+            "INSERT INTO analisis (user_id, mes, total_gastado, estado, categoria_principal, "
+            "porcentaje_principal, gastos_hormiga, recomendaciones, resumen) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                mes,
+                total,
+                analisis.estado,
+                analisis.categoria_principal,
+                analisis.porcentaje_principal,
+                # SQLite no tiene un tipo lista: se guarda como texto JSON.
+                json.dumps(analisis.gastos_hormiga, ensure_ascii=False),
+                json.dumps(analisis.recomendaciones, ensure_ascii=False),
+                analisis.resumen,
+            ),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+# ---------------------------------------------------------------------------
+# Presupuesto mensual (v6, flujo guiado)
+# ---------------------------------------------------------------------------
+
+async def guardar_presupuesto(user_id: int, mes: str, ingreso: float, ahorro: float) -> None:
+    """Guarda el presupuesto del mes. Si ya había uno para ese mes, lo reemplaza."""
+    async with aiosqlite.connect(RUTA_DB) as db:
+        # ON CONFLICT ... DO UPDATE: si ya existe la fila (mismo usuario y mes),
+        # se actualizan sus valores en lugar de dar error.
+        await db.execute(
+            "INSERT INTO presupuestos (user_id, mes, ingreso, ahorro) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (user_id, mes) DO UPDATE SET ingreso = excluded.ingreso, "
+            "ahorro = excluded.ahorro, creado = CURRENT_TIMESTAMP",
+            (user_id, mes, ingreso, ahorro),
+        )
+        await db.commit()
+
+
+async def obtener_presupuesto(user_id: int, mes: str) -> dict | None:
+    """Devuelve el presupuesto del mes del usuario, o None si no armó uno."""
+    async with aiosqlite.connect(RUTA_DB) as db:
+        cursor = await db.execute(
+            "SELECT ingreso, ahorro FROM presupuestos WHERE user_id = ? AND mes = ?",
+            (user_id, mes),
+        )
+        fila = await cursor.fetchone()
+    if fila is None:
+        return None
+    ingreso, ahorro = fila
+    return {"ingreso_ars": ingreso, "meta_ahorro_ars": ahorro, "para_gastar_ars": ingreso - ahorro}

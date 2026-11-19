@@ -105,7 +105,15 @@ async def consultar_gastos(user_id: int, mes: str | None = None) -> dict:
     except ValueError:
         return {"error": f"Mes inválido: {mes}. Usá el formato AAAA-MM."}
 
-    return await db.resumen_gastos(user_id, mes)
+    resumen = await db.resumen_gastos(user_id, mes)
+
+    # Si el usuario armó su presupuesto con /presupuesto, se agrega con la
+    # cuenta ya hecha: así el modelo no tiene que restar de memoria.
+    presupuesto = await db.obtener_presupuesto(user_id, mes)
+    if presupuesto:
+        presupuesto["restante_ars"] = presupuesto["para_gastar_ars"] - resumen["total_ars"]
+    resumen["presupuesto"] = presupuesto        # None si no armó uno
+    return resumen
 
 
 async def consultar_inflacion(meses: int = 1) -> dict:
@@ -186,7 +194,10 @@ DECLARACIONES = [
                 "categoria": {
                     "type": "string",
                     "enum": CATEGORIAS,     # el modelo solo puede elegir una de estas
-                    "description": "Categoría del gasto. Si no encaja en ninguna, usá 'Otros'.",
+                    "description": (
+                        "Categoría del gasto. Las suscripciones digitales (Spotify, Netflix, juegos) "
+                        "van en 'Salidas y ocio'. Si no encaja en ninguna, usá 'Otros'."
+                    ),
                 },
                 "descripcion": {
                     "type": "string",
@@ -208,7 +219,8 @@ DECLARACIONES = [
         "name": "consultar_gastos",
         "description": (
             "Devuelve los gastos registrados del usuario en un mes: total, total por categoría, "
-            "cantidad y los últimos gastos. Usala cuando pregunte cuánto gastó, en qué se le va "
+            "cantidad y los últimos gastos. Si armó su presupuesto, incluye el ingreso, la meta de "
+            "ahorro y cuánto le queda. Usala cuando pregunte cuánto gastó, en qué se le va "
             "la plata o cuánto le queda del presupuesto."
         ),
         "parameters": {
